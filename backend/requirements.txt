@@ -1,0 +1,15 @@
+flask
+flask-cors
+gunicorn
+langchain
+langchain-community
+transformers
+sentence-transformers
+faiss-cpu
+python-dotenv
+orjson
+redis
+coqpit
+coqui-tts
+soundfile
+pandas
