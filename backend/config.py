@@ -4,7 +4,7 @@ load_dotenv()
 
 class Settings:
     ENV = os.getenv("ENV", "production")
-    PORT = i/nt(os.getenv("PORT", "8000"))
+    PORT = int(os.getenv("PORT", "8000"))
     CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*")
 
     # Models

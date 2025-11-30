@@ -6,8 +6,8 @@ from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.llms import HuggingFacePipeline
 from transformers import pipeline
-from .config import settings
-from .logging import logger
+from config import settings
+from life_bridge_logger import logger
 
 def load_vectorstore() -> FAISS:
     logger.info(f"Loading FAISS index from {settings.INDEX_DIR}")
@@ -22,7 +22,7 @@ def build_llm():
 
 def build_prompt():
     # Few-shot style instructions tuned for structured first-aid answers
-    template = """You are a First Aid assistant for Kenya context. Use ONLY the provided context from trusted sources.
+    template = """You are a First Aid assistant for LifeBridge First Aid in  Kenya. Use ONLY the provided context from trusted sources.
 Return four sections:
 1) Numbered steps (short imperative sentences).
 2) 'Do not' warnings.
@@ -51,6 +51,11 @@ def chain_with_memory(vectorstore, llm, memory):
         retriever=retriever,
         memory=memory,
         combine_docs_chain_kwargs={"prompt": prompt},
+        # Ensure memory knows which output to persist when the chain returns
+        # multiple keys (e.g. 'answer' and 'source_documents'). Setting
+        # output_key to 'answer' tells LangChain to store the textual
+        # answer into the conversation memory.
+        output_key="answer",
         return_source_documents=True,
         verbose=False,
     )

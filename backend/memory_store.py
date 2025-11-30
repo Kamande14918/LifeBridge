@@ -1,8 +1,38 @@
 from typing import Dict, List
-from langchain.memory import ConversationBufferMemory
 import redis, json
-from .config import settings
-from .logging import logger
+from config import settings
+from life_bridge_logger import logger
+
+# ConversationBufferMemory is provided by langchain. Different LangChain
+# releases expose the class in different modules; attempt multiple import
+# locations and fall back to a helpful error message.
+ConversationBufferMemory = None
+import importlib
+_try_paths = [
+    "langchain.memory",
+    "langchain.memory.buffer",
+    "langchain.memory.chat_memory",
+    "langchain.memory.conversation_buffer",
+]
+for _p in _try_paths:
+    try:
+        mod = importlib.import_module(_p)
+        if hasattr(mod, "ConversationBufferMemory"):
+            ConversationBufferMemory = getattr(mod, "ConversationBufferMemory")
+            break
+    except Exception:
+        continue
+
+if ConversationBufferMemory is None:
+    # Provide an actionable error message with guidance.
+    raise ImportError(
+        "Could not find `ConversationBufferMemory` in the installed langchain package.\n"
+        "This project expects LangChain to provide `ConversationBufferMemory`.\n"
+        "Please install the project's dependencies into your virtualenv and ensure you run Python from the same environment:\n"
+        "  .\\venv\\Scripts\\Activate.ps1   # PowerShell activate (Windows)\n"
+        "  pip install -r requirements.txt\n"
+        "If you have a custom or very new/old LangChain version, you may need to install a compatible version, for example: `pip install 'langchain==1.1.0'`.\n"
+    )
 
 class InMemoryChatStore:
     def __init__(self):

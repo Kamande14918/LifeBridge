@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>LifeBridge Chat Tester</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:0;padding:0;background:#f5f6fa}
+    .app{max-width:920px;margin:28px auto;padding:20px;background:#fff;border-radius:8px;box-shadow:0 6px 20px rgba(0,0,0,.06)}
+    header{display:flex;align-items:center;justify-content:space-between}
+    .controls{display:flex;gap:8px;align-items:center}
+    .chat{border:1px solid #e6e9ef;height:520px;overflow:auto;padding:12px;border-radius:6px;background:#fbfdff}
+    .msg{margin:8px 0;padding:10px;border-radius:8px;max-width:78%}
+    .from-user{background:#dfefff;margin-left:auto}
+    .from-bot{background:#fff;margin-right:auto;border:1px solid #e6eefc}
+    .meta{font-size:12px;color:#666;margin-top:6px}
+    .row{display:flex;gap:8px;margin-top:12px}
+    input[type=text],textarea,select{padding:8px;border-radius:6px;border:1px solid #d9e0ef;width:100%}
+    button{padding:8px 12px;border-radius:6px;border:0;background:#2563eb;color:#fff;cursor:pointer}
+    button.secondary{background:#64748b}
+    pre{background:#0b1220;color:#dff3ff;padding:12px;border-radius:6px;overflow:auto}
+    .small{font-size:13px;color:#333}
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <h2>LifeBridge Chat Tester</h2>
+      <div class="controls">
+        <label class="small">API Base:</label>
+        <input id="baseUrl" type="text" value="http://localhost:8000" style="width:260px" />
+        <button id="healthBtn" class="secondary">Health</button>
+      </div>
+    </header>
+
+    <section style="margin-top:12px">
+      <div style="display:flex;gap:12px">
+        <div style="flex:1;display:flex;flex-direction:column">
+          <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+            <label class="small">Chat ID:</label>
+            <input id="chatId" type="text" value="test-session" style="width:200px" />
+            <label class="small">TTS:</label>
+            <select id="ttsToggle"><option value="false">Disabled</option><option value="true">Enabled</option></select>
+          </div>
+
+          <div id="chat" class="chat" aria-live="polite"></div>
+
+          <div class="row">
+            <textarea id="message" rows="2" placeholder="Type message... (e.g. 'I saw someone faint')"></textarea>
+            <div style="display:flex;flex-direction:column">
+              <button id="sendBtn">Send</button>
+              <button id="clearBtn" class="secondary" style="margin-top:8px">Clear</button>
+            </div>
+          </div>
+        </div>
+
+        <aside style="width:340px">
+          <div style="margin-bottom:10px">
+            <div class="small"><strong>Contacts lookup</strong></div>
+            <div style="display:flex;gap:8px;margin-top:6px">
+              <input id="contactQ" type="text" placeholder="search query (e.g. snake bite)" />
+              <button id="contactBtn">Search</button>
+            </div>
+            <div id="contacts" style="margin-top:8px"></div>
+          </div>
+
+          <div style="margin-top:12px">
+            <div class="small"><strong>TTS demo</strong></div>
+            <textarea id="ttsText" rows="3" placeholder="Text to synthesize..."></textarea>
+            <div style="display:flex;gap:8px;margin-top:6px">
+              <button id="ttsBtn">Synthesize</button>
+              <button id="playBtn" class="secondary">Play last</button>
+            </div>
+            <div id="audioInfo" class="meta" style="margin-top:8px"></div>
+          </div>
+
+          <div style="margin-top:12px">
+            <div class="small"><strong>Raw Response</strong></div>
+            <pre id="raw" style="height:200px">{}</pre>
+          </div>
+        </aside>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    const chatEl = document.getElementById('chat');
+    const baseInput = document.getElementById('baseUrl');
+    const chatIdInput = document.getElementById('chatId');
+    const ttsToggle = document.getElementById('ttsToggle');
+    const rawEl = document.getElementById('raw');
+    const audioInfo = document.getElementById('audioInfo');
+    let lastAudioUrl = null;
+    const audioPlayer = new Audio();
+
+    function appendMessage(text, from='bot'){
+      const d = document.createElement('div');
+      d.className = 'msg ' + (from==='user' ? 'from-user' : 'from-bot');
+      d.innerHTML = text;
+      chatEl.appendChild(d);
+      chatEl.scrollTop = chatEl.scrollHeight;
+    }
+
+    async function doHealth(){
+      const base = baseInput.value.replace(/\/$/, '');
+      try{
+        const r = await fetch(base + '/api/health');
+        const j = await r.json();
+        rawEl.textContent = JSON.stringify(j, null, 2);
+        appendMessage('<strong>Health</strong>: ' + (j.status||'unknown'));
+      }catch(e){
+        appendMessage('<strong>Health error</strong>: '+ e.message, 'bot');
+      }
+    }
+
+    document.getElementById('healthBtn').addEventListener('click', doHealth);
+
+    document.getElementById('sendBtn').addEventListener('click', async ()=>{
+      const txt = document.getElementById('message').value.trim();
+      if(!txt) return;
+      appendMessage(txt, 'user');
+      document.getElementById('message').value = '';
+      const base = baseInput.value.replace(/\/$/, '');
+      const payload = { chat_id: chatIdInput.value || 'default', message: txt, k: 5 };
+      try{
+        const r = await fetch(base + '/api/chat', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+        const j = await r.json();
+        rawEl.textContent = JSON.stringify(j, null, 2);
+
+        // Build readable bot output
+        const parts = [];
+        if(j.steps && j.steps.length) parts.push('<strong>Steps:</strong><br>' + j.steps.map((s,i)=> (i+1)+'. '+s).join('<br>'));
+        if(j.warnings && j.warnings.length) parts.push('<strong>Warnings:</strong><br>' + j.warnings.join('<br>'));
+        if(j.escalate && j.escalate.length) parts.push('<strong>Escalate:</strong><br>' + j.escalate.join('<br>'));
+        if(j.contacts && j.contacts.length) parts.push('<strong>Contacts:</strong><br>' + j.contacts.join('<br>'));
+        if(j.visual_guide) parts.push('<strong>Visual:</strong> <a href="'+j.visual_guide+'" target="_blank">view</a>');
+        parts.push('<em>Confidence: '+(j.confidence ?? 'n/a')+'</em>');
+
+        appendMessage(parts.join('<hr>'), 'bot');
+
+        // Play audio if present
+        if(j.audio_url){
+          lastAudioUrl = j.audio_url;
+          audioInfo.textContent = 'Last audio: ' + lastAudioUrl;
+          audioPlayer.src = lastAudioUrl;
+          audioPlayer.play().catch(()=>{});
+        }
+
+      }catch(err){
+        appendMessage('<strong>Error</strong>: '+err.message, 'bot');
+      }
+    });
+
+    document.getElementById('clearBtn').addEventListener('click', ()=>{chatEl.innerHTML=''; rawEl.textContent='{}'; audioInfo.textContent=''; lastAudioUrl=null; audioPlayer.pause(); audioPlayer.src='';});
+
+    // Contacts
+    document.getElementById('contactBtn').addEventListener('click', async ()=>{
+      const q = document.getElementById('contactQ').value.trim();
+      if(!q) return alert('Enter a search query');
+      const base = baseInput.value.replace(/\/$/, '');
+      try{
+        const r = await fetch(base + '/api/contacts?q=' + encodeURIComponent(q));
+        const j = await r.json();
+        rawEl.textContent = JSON.stringify(j, null, 2);
+        const el = document.getElementById('contacts');
+        if(r.status === 200 && j.contacts){
+          el.innerHTML = '<strong>'+(j.title||'')+'</strong><br>' + j.contacts.join('<br>');
+        } else {
+          el.textContent = 'No contacts';
+        }
+      }catch(e){
+        alert('Contacts error: '+e.message);
+      }
+    });
+
+    // TTS
+    document.getElementById('ttsBtn').addEventListener('click', async ()=>{
+      const text = document.getElementById('ttsText').value.trim();
+      if(!text) return alert('Enter text for TTS');
+      const base = baseInput.value.replace(/\/$/, '');
+      try{
+        const r = await fetch(base + '/api/tts', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text})});
+        const j = await r.json();
+        rawEl.textContent = JSON.stringify(j, null, 2);
+        if(j.audio_url){
+          lastAudioUrl = j.audio_url; audioPlayer.src = lastAudioUrl; audioPlayer.play().catch(()=>{});
+          audioInfo.textContent = 'Last audio: ' + lastAudioUrl;
+        } else {
+          audioInfo.textContent = 'No audio returned';
+        }
+      }catch(e){
+        alert('TTS error: '+e.message);
+      }
+    });
+
+    document.getElementById('playBtn').addEventListener('click', ()=>{
+      if(!lastAudioUrl) return alert('No audio available');
+      audioPlayer.src = lastAudioUrl; audioPlayer.play().catch(()=>{});
+    });
+
+    // TTS toggle determines what we tell server locally (not submitted) but helps test
+    ttsToggle.addEventListener('change', ()=>{
+      document.getElementById('ttsText').disabled = (ttsToggle.value!=='true');
+    });
+
+    // initial health check
+    // doHealth();
+  </script>
+</body>
+</html>
