@@ -17,19 +17,44 @@ def load_vectorstore() -> FAISS:
 
 def build_llm():
     logger.info(f"Loading generator: {settings.GENERATION_MODEL}")
-    gen_pipe = pipeline("text2text-generation", model=settings.GENERATION_MODEL, max_new_tokens=settings.MAX_NEW_TOKENS)
+    # Use low temperature and deterministic decoding to reduce hallucinations.
+    # `do_sample=False` ensures greedy decoding where possible.
+    gen_pipe = pipeline(
+        "text2text-generation",
+        model=settings.GENERATION_MODEL,
+        max_new_tokens=settings.MAX_NEW_TOKENS,
+        do_sample=False,
+        temperature=0.0,
+    )
     return HuggingFacePipeline(pipeline=gen_pipe)
 
 def build_prompt():
-    # Few-shot style instructions tuned for structured first-aid answers
-    template = """You are a First Aid assistant for LifeBridge First Aid in  Kenya. Use ONLY the provided context from trusted sources.
-Return four sections:
-1) Numbered steps (short imperative sentences).
+    # Few-shot style instructions tuned for structured first-aid answers.
+    # Strong grounding instructions: insist on using ONLY the provided
+    # context and include inline citations. If the answer cannot be found
+    # in the provided context, respond with a short safe fallback and the
+    # string "INSUFFICIENT_CONTEXT" so callers can detect low-coverage
+    # answers.
+    template = """You are a First Aid assistant for LifeBridge First Aid in Kenya.
+Use ONLY the provided context (do NOT use prior model knowledge). If the
+context does not contain an answer, do NOT guess — instead return the
+phrase: INSUFFICIENT_CONTEXT and then a short emergency safety fallback.
+
+Return four sections, separated clearly:
+1) Numbered steps (short imperative sentences). After any step that
+   depends on a retrieved source, include the source title in square
+   brackets, e.g. "Apply pressure to the wound. [First Aid Manual]".
 2) 'Do not' warnings.
 3) When to escalate (call emergency services).
 4) Emergency contacts (from context).
 
-If visual guide URLs exist, add: Visual guide: <URL>
+If visual guide URLs exist in the context, add: Visual guide: <URL>
+
+Strict rules:
+- Use ONLY the provided context. Do not invent facts or sources.
+- If you cannot answer from the context, output exactly the word
+  INSUFFICIENT_CONTEXT on its own line, then a brief safety fallback.
+- Do not repeat or pad steps with filler or repeated phrases.
 
 Context:
 {context}
@@ -59,7 +84,74 @@ def chain_with_memory(vectorstore, llm, memory):
         return_source_documents=True,
         verbose=False,
     )
-    return chain
+    # LangChain sometimes attempts to save to memory automatically and may
+    # raise if multiple output keys are present. To keep full memory
+    # functionality while avoiding ambiguous automatic saves, wrap the
+    # chain so we manually control what gets written to memory.
+
+    class _MemoryProxy:
+        """A thin proxy that exposes the read methods used by chains but
+        no-op's the save_context call to prevent automatic ambiguous writes.
+        """
+        def __init__(self, real):
+            self._real = real
+
+        def load_memory_variables(self, inputs: Dict[str, Any]):
+            return self._real.load_memory_variables(inputs)
+
+        def __getattr__(self, name):
+            # Delegate other attributes to the real memory (e.g., chat_memory)
+            return getattr(self._real, name)
+
+        def save_context(self, *args, **kwargs):
+            # Intentionally no-op: we'll save explicitly after invoke
+            return None
+
+    class _WrappedChain:
+        def __init__(self, inner_chain, real_memory):
+            self._chain = inner_chain
+            self._real_memory = real_memory
+            # Replace the chain's memory with the proxy to prevent auto-save
+            if real_memory is not None:
+                self._chain.memory = _MemoryProxy(real_memory)
+                # Also monkeypatch the real memory's save_context so that if any
+                # internal chain tries to call it directly, it will only store
+                # the 'answer' field (avoids ambiguous multiple output keys).
+                if hasattr(real_memory, 'save_context'):
+                    original_save = real_memory.save_context
+
+                    def _safe_save(inputs, outputs):
+                        try:
+                            # If outputs contains multiple keys, pick 'answer'
+                            if isinstance(outputs, dict) and 'answer' in outputs:
+                                original_save(inputs, {'answer': outputs.get('answer')})
+                            else:
+                                # If single key or not a dict, pass through
+                                original_save(inputs, outputs)
+                        except Exception as e:
+                            logger.warning(f"Wrapped memory.save_context failed: {e}")
+
+                    # Replace method
+                    try:
+                        real_memory.save_context = _safe_save
+                    except Exception:
+                        # Some memory implementations may not allow assignment; ignore
+                        pass
+
+        def invoke(self, inputs: Dict[str, Any]):
+            # Call the underlying chain
+            result = self._chain.invoke(inputs)
+            # After successful invoke, persist only the 'answer' into memory if
+            # the real memory supports save_context and wasn't already called.
+            try:
+                if self._real_memory is not None and hasattr(self._real_memory, 'save_context'):
+                    # Call with a single-key output to avoid ambiguity
+                    self._real_memory.save_context(inputs, {'answer': result.get('answer')})
+            except Exception:
+                logger.warning("Failed to save chat memory (non-fatal)")
+            return result
+
+    return _WrappedChain(chain, memory)
 
 def parse_answer(text: str):
     # Parse sections robustly
@@ -69,6 +161,15 @@ def parse_answer(text: str):
         ln = line.strip()
         if not ln:
             continue
+        # Detect the explicit INSUFFICIENT_CONTEXT marker and return fallback
+        if ln == "INSUFFICIENT_CONTEXT":
+            return {
+                "steps": [],
+                "warnings": [],
+                "escalate": ["INSUFFICIENT_CONTEXT"],
+                "contacts": [],
+                "visual_guide": None,
+            }
         low = ln.lower()
         if low.startswith("1)") or "steps" in low:
             section = "steps"; continue
@@ -97,6 +198,11 @@ def parse_answer(text: str):
 def compute_confidence(source_docs: List[Document]) -> float:
     if not source_docs:
         return 0.0
-    # Heuristic: more sources -> higher confidence
-    base = min(len(source_docs) / settings.TOP_K, 1.0)
-    return round(0.4 + 0.6 * base, 3)
+    # Heuristic: more non-empty sources -> higher confidence. If source
+    # titles are empty (or all blank), reduce confidence because the chain
+    # may be hallucinating sources.
+    titles = [getattr(d.metadata, 'title', None) if hasattr(d, 'metadata') else d.metadata.get('title') if isinstance(d.metadata, dict) else None for d in source_docs]
+    non_empty = sum(1 for t in titles if t)
+    base = min(non_empty / max(settings.TOP_K, 1), 1.0)
+    # Scale between 0.2 and 1.0 to avoid presenting overly confident values
+    return round(0.2 + 0.8 * base, 3)
