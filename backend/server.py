@@ -4,7 +4,7 @@ from flask_cors import CORS
 from config import settings
 from life_bridge_logger import logger
 from memory_store import get_store, RedisChatStore
-from rag_chains import load_vectorstore, build_llm, chain_with_memory, parse_answer, compute_confidence, generate_rule_based_fallback, _extract_primary_actions_from_doc
+from rag_chains import load_vectorstore, build_llm, chain_with_memory, parse_answer, compute_confidence, generate_rule_based_fallback, _extract_primary_actions_from_doc, _get_cached_retriever
 import os
 import threading
 from werkzeug.exceptions import HTTPException
@@ -178,14 +178,22 @@ def chat():
             retrieved_docs = []
             if vectorstore is not None:
                 try:
-                    retr = vectorstore.as_retriever(search_kwargs={"k": settings.TOP_K})
-                    retrieved_docs = retr.get_relevant_documents(message)
+                    retr = _get_cached_retriever(vectorstore, settings.TOP_K)
+                    if retr is None:
+                        # fallback to direct API
+                        if hasattr(vectorstore, 'similarity_search'):
+                            retrieved_docs = vectorstore.similarity_search(message, k=settings.TOP_K)
+                        else:
+                            retrieved_docs = []
+                    else:
+                        if hasattr(retr, 'get_relevant_documents'):
+                            retrieved_docs = retr.get_relevant_documents(message)
+                        elif callable(retr):
+                            retrieved_docs = retr(message, settings.TOP_K)
+                        else:
+                            retrieved_docs = []
                 except Exception:
-                    # fallback to alternative API
-                    try:
-                        retrieved_docs = vectorstore.similarity_search(message, k=settings.TOP_K)
-                    except Exception:
-                        retrieved_docs = []
+                    retrieved_docs = []
 
             if retrieved_docs:
                 # Prefer extracting Primary Action steps directly from the
@@ -297,8 +305,22 @@ def contacts():
     q = request.args.get("q", "").strip()
     if not q:
         return jsonify({"error":"q required"}), 400
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 1})
-    docs = retriever.get_relevant_documents(q)
+    retriever = _get_cached_retriever(vectorstore, 1)
+    if retriever is None:
+        if hasattr(vectorstore, 'similarity_search'):
+            try:
+                docs = vectorstore.similarity_search(q, k=1)
+            except Exception:
+                docs = []
+        else:
+            docs = []
+    else:
+        if hasattr(retriever, 'get_relevant_documents'):
+            docs = retriever.get_relevant_documents(q)
+        elif callable(retriever):
+            docs = retriever(q, 1)
+        else:
+            docs = []
     if not docs:
         return jsonify({"contacts":[],"title":None})
     md = docs[0].metadata

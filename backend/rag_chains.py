@@ -60,6 +60,41 @@ from transformers import pipeline
 from config import settings
 from life_bridge_logger import logger
 
+# Cache retrievers per vectorstore instance to avoid recreating them per-request
+_retriever_cache: Dict[int, Any] = {}
+
+
+def _get_cached_retriever(vectorstore, k: int):
+    """Return a cached retriever for a vectorstore and k, creating it if needed."""
+    try:
+        key = (id(vectorstore), int(k))
+    except Exception:
+        key = id(vectorstore)
+    if key in _retriever_cache:
+        return _retriever_cache[key]
+    # Create retriever using common APIs and cache it
+    retr = None
+    try:
+        if hasattr(vectorstore, 'as_retriever'):
+            retr = vectorstore.as_retriever(search_kwargs={"k": k})
+        else:
+            # Some older vectorstores expect plain parameters
+            def _simple_retriever(q, k_override=None):
+                return vectorstore.similarity_search(q, k=(k_override or k))
+
+            retr = _simple_retriever
+    except Exception:
+        # Best-effort fallback: try to construct a callable wrapper
+        if hasattr(vectorstore, 'similarity_search'):
+            def _simple_retriever(q, k_override=None):
+                return vectorstore.similarity_search(q, k=(k_override or k))
+            retr = _simple_retriever
+        else:
+            retr = None
+
+    _retriever_cache[key] = retr
+    return retr
+
 def load_vectorstore() -> FAISS:
     logger.info(f"Loading FAISS index from {settings.INDEX_DIR}")
     if HuggingFaceEmbeddings is None or FAISS is None:
@@ -82,12 +117,14 @@ def build_llm():
             "Install `langchain-huggingface` or update LangChain to a compatible release."
         )
 
+    # Note: some transformer generation flags (e.g., `temperature`) may be
+    # ignored by specific model/config combinations. Avoid passing flags
+    # that cause warnings; set verbosity via `TRANSFORMERS_VERBOSITY=info`.
     gen_pipe = pipeline(
         "text2text-generation",
         model=settings.GENERATION_MODEL,
         max_new_tokens=settings.MAX_NEW_TOKENS,
         do_sample=False,
-        temperature=0.0,
     )
     return HuggingFacePipeline(pipeline=gen_pipe)
 
@@ -186,7 +223,7 @@ def chain_with_memory(vectorstore, llm, memory):
                 "Or install the components directly:\n"
                 "  pip install langchain langchain-huggingface langchain-community sentence-transformers faiss-cpu\n"
             )
-        retriever = vectorstore.as_retriever(search_kwargs={"k": settings.TOP_K})
+        retriever = _get_cached_retriever(vectorstore, settings.TOP_K)
         # ConversationalRetrievalChain injects memory chat history and retrieved docs into prompt
         chain = ConversationalRetrievalChain.from_llm(
             llm=llm,
@@ -207,19 +244,34 @@ def chain_with_memory(vectorstore, llm, memory):
         # 2) construct a context string and format the prompt
         # 3) call the LLM pipeline directly and return a similar result shape
         def _retrieve_docs(query: str, k: int = settings.TOP_K):
-            # Try common retrieval APIs
-            try:
-                if hasattr(vectorstore, "as_retriever"):
-                    retr = vectorstore.as_retriever(search_kwargs={"k": k})
+            # Use cached retriever when possible
+            retr = _get_cached_retriever(vectorstore, k)
+            if retr is None:
+                # Last resort: try direct similarity_search if present
+                if hasattr(vectorstore, 'similarity_search'):
+                    try:
+                        return vectorstore.similarity_search(query, k=k)
+                    except Exception:
+                        pass
+                raise RuntimeError("Vectorstore does not expose a recognisable retrieval API")
+
+            # If retr is an object exposing get_relevant_documents, call it
+            if hasattr(retr, 'get_relevant_documents'):
+                try:
                     return retr.get_relevant_documents(query)
-            except Exception:
-                pass
-            try:
-                if hasattr(vectorstore, "similarity_search"):
-                    return vectorstore.similarity_search(query, k=k)
-            except Exception:
-                pass
-            raise RuntimeError("Vectorstore does not expose a recognisable retrieval API")
+                except Exception:
+                    pass
+
+            # If retr is callable (simple wrapper), call it
+            if callable(retr):
+                try:
+                    docs = retr(query, k)
+                    return docs
+                except Exception:
+                    pass
+
+            # Fallback: raise
+            raise RuntimeError("Failed to use cached retriever for retrieval")
 
         class _SimpleFallbackChain:
             def __init__(self, vectorstore, llm, memory):
@@ -276,11 +328,65 @@ def chain_with_memory(vectorstore, llm, memory):
         """A thin proxy that exposes the read methods used by chains but
         no-op's the save_context call to prevent automatic ambiguous writes.
         """
-        def __init__(self, real):
+        def __init__(self, real, history_limit: int = 3):
             self._real = real
+            self._history_limit = history_limit
 
         def load_memory_variables(self, inputs: Dict[str, Any]):
-            return self._real.load_memory_variables(inputs)
+            # Return a truncated/formatted chat_history to avoid sending
+            # long unrelated conversations into the prompt. Keep only the
+            # last `history_limit` turns.
+            try:
+                mem = self._real.load_memory_variables(inputs)
+            except Exception:
+                return {}
+
+            # Identify the memory key (commonly 'chat_history')
+            key = None
+            if isinstance(mem, dict):
+                # prefer known keys
+                for candidate in ("chat_history", "history", "conversation"):
+                    if candidate in mem:
+                        key = candidate
+                        break
+                # fallback to first key
+                if key is None and len(mem) > 0:
+                    key = next(iter(mem.keys()))
+            if key is None:
+                return mem
+
+            val = mem.get(key)
+            # If the memory is a list of messages, take the last N and format
+            if isinstance(val, list):
+                items = val[-self._history_limit:]
+                formatted = []
+                for m in items:
+                    try:
+                        # m may be a dict with 'input' and 'output' keys
+                        if isinstance(m, dict):
+                            user = m.get('input') or m.get('user') or ''
+                            bot = m.get('output') or m.get('assistant') or ''
+                            # If input/output are dicts, stringify
+                            if isinstance(user, dict):
+                                user = str(user)
+                            if isinstance(bot, dict):
+                                bot = str(bot)
+                            if user:
+                                formatted.append(f"User: {user}")
+                            if bot:
+                                formatted.append(f"Assistant: {bot}")
+                        else:
+                            formatted.append(str(m))
+                    except Exception:
+                        continue
+                return {key: "\n".join(formatted)}
+
+            # If memory already returned a string, truncate by lines
+            if isinstance(val, str):
+                lines = [l for l in val.splitlines() if l.strip()]
+                return {key: "\n".join(lines[-self._history_limit:])}
+
+            return mem
 
         def __getattr__(self, name):
             # Delegate other attributes to the real memory (e.g., chat_memory)
