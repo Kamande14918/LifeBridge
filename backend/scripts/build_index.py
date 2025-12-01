@@ -30,16 +30,53 @@ from config import settings
 def load_rows(csv_path):
     rows = []
     with open(csv_path, newline='', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        for r in reader:
-            rows.append(r)
+        # Robust CSV reading: skip leading blank lines and ensure header
+        # is read correctly even if the file starts with an empty line.
+        reader = csv.reader(f)
+        header = None
+        for row in reader:
+            # skip empty rows
+            if not row or all((not c or str(c).strip() == '') for c in row):
+                continue
+            # first non-empty row is the header
+            header = [h.strip() for h in row]
+            break
+        if header is None:
+            return rows
+        # Now read remaining rows and map to header
+        for row in reader:
+            if not row or all((not c or str(c).strip() == '') for c in row):
+                continue
+            # If row length mismatches header, pad with empty strings
+            if len(row) < len(header):
+                row = row + [''] * (len(header) - len(row))
+            mapped = {h: v for h, v in zip(header, row)}
+            rows.append(mapped)
     return rows
 
 def build_index():
-    data_dir = Path(settings.DATA_DIR)
-    csv_path = data_dir / 'first_aid_sample.csv'
-    if not csv_path.exists():
-        raise RuntimeError(f"CSV not found: {csv_path}")
+    # Resolve DATA_DIR relative to the project root when a relative path
+    # is used in settings. Also try fallback locations commonly used in
+    # this repo so the script works when run from `backend/scripts`.
+    candidates = []
+    configured = Path(settings.DATA_DIR)
+    if configured.is_absolute():
+        candidates.append(configured)
+    else:
+        candidates.append(ROOT / configured)
+        candidates.append(ROOT / 'data')
+        candidates.append(ROOT / 'app' / 'data')
+
+    csv_path = None
+    for d in candidates:
+        p = Path(d) / 'first_aid_sample.csv'
+        if p.exists():
+            csv_path = p
+            break
+
+    if csv_path is None:
+        tried = ', '.join(str((Path(d) / 'first_aid_sample.csv')) for d in candidates)
+        raise RuntimeError(f"CSV not found; checked: {tried}")
 
     print(f"Loading CSV from {csv_path}")
     rows = load_rows(csv_path)
@@ -57,7 +94,9 @@ def build_index():
         metadatas.append({
             'title': r.get('Scenario',''),
             'contacts': r.get('Emergency Contact',''),
-            'visual': r.get('VisualGuideURL','')
+            'visual': r.get('VisualGuideURL',''),
+            'primary_action': r.get('Primary Action',''),
+            'question': r.get('Question','')
         })
 
     print(f"Preparing embeddings using model: {settings.EMBEDDING_MODEL}")
@@ -69,14 +108,38 @@ def build_index():
         print("Computing embeddings (this may take a while)...")
         # langchain FAISS.from_documents expects Document objects (with
         # a `page_content` attribute). Construct proper Documents here.
-        from langchain.schema import Document
-        docs = []
-        for t, m in zip(texts, metadatas):
-            docs.append(Document(page_content=t, metadata=m))
+        # The `Document` import path changed across LangChain versions.
+        # Try the common locations, and fall back to `FAISS.from_texts`
+        # when a Document class is not available.
+        try:
+            from langchain.schema import Document  # new path
+        except Exception:
+            try:
+                from langchain.docstore.document import Document  # older path
+            except Exception:
+                Document = None
 
-        # Build FAISS index
-        vs = FAISS.from_documents(docs, embeddings)
-        index_dir = Path(settings.INDEX_DIR)
+        if Document is not None:
+            docs = [Document(page_content=t, metadata=m) for t, m in zip(texts, metadatas)]
+            # Build FAISS index from Document objects
+            vs = FAISS.from_documents(docs, embeddings)
+        else:
+            # Try to build directly from texts (some FAISS wrappers support this)
+            try:
+                vs = FAISS.from_texts(texts, embeddings, metadatas=metadatas)
+            except Exception as e_texts:
+                raise RuntimeError(
+                    "Could not construct Document objects nor use FAISS.from_texts. "
+                    "Install a compatible `langchain` (or `langchain-huggingface`) and retry. "
+                    f"Underlying error: {e_texts}"
+                )
+        # Resolve index directory similarly so save/load use the same path
+        configured_index = Path(settings.INDEX_DIR)
+        if configured_index.is_absolute():
+            index_dir = configured_index
+        else:
+            index_dir = ROOT / configured_index
+
         index_dir.mkdir(parents=True, exist_ok=True)
         print(f"Saving index to {index_dir}")
         vs.save_local(str(index_dir))

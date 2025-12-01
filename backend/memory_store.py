@@ -1,4 +1,4 @@
-from typing import Dict, List
+from typing import Dict, List, Any
 import redis, json
 from config import settings
 from life_bridge_logger import logger
@@ -24,21 +24,48 @@ for _p in _try_paths:
         continue
 
 if ConversationBufferMemory is None:
-    # Provide an actionable error message with guidance.
-    raise ImportError(
-        "Could not find `ConversationBufferMemory` in the installed langchain package.\n"
-        "This project expects LangChain to provide `ConversationBufferMemory`.\n"
-        "Please install the project's dependencies into your virtualenv and ensure you run Python from the same environment:\n"
-        "  .\\venv\\Scripts\\Activate.ps1   # PowerShell activate (Windows)\n"
-        "  pip install -r requirements.txt\n"
-        "If you have a custom or very new/old LangChain version, you may need to install a compatible version, for example: `pip install 'langchain==1.1.0'`.\n"
+    # If LangChain's ConversationBufferMemory isn't available (different
+    # langchain versions expose memory utilities in different modules),
+    # provide a small, local fallback so the app can run. This fallback
+    # implements the minimal interface used by this project: a
+    # `.chat_memory.messages` list, `load_memory_variables(...)`, and
+    # `save_context(...)`. It is intentionally simple and should be
+    # replaced by the real LangChain class in production for full
+    # compatibility.
+    logger.warning(
+        "ConversationBufferMemory not found in langchain; using lightweight fallback. "
+        "Install a compatible langchain version for full features: `pip install -r requirements.txt`."
     )
+
+    class _SimpleChatMemory:
+        def __init__(self):
+            self.messages = []
+
+    class _SimpleConversationBufferMemory:
+        def __init__(self, return_messages: bool = True, memory_key: str = "chat_history"):
+            self.return_messages = return_messages
+            self.memory_key = memory_key
+            self.chat_memory = _SimpleChatMemory()
+
+        def load_memory_variables(self, inputs: dict):
+            # Return memory in the shape expected by callers
+            return {self.memory_key: self.chat_memory.messages}
+
+        def save_context(self, inputs: dict, outputs: dict):
+            # Append a simple record; callers may expect dict-like objects
+            try:
+                self.chat_memory.messages.append({"input": inputs, "output": outputs})
+            except Exception:
+                # keep the fallback robust
+                pass
+
+    ConversationBufferMemory = _SimpleConversationBufferMemory
 
 class InMemoryChatStore:
     def __init__(self):
-        self.sessions: Dict[str, ConversationBufferMemory] = {}
+        self.sessions: Dict[str, Any] = {}
 
-    def get(self, chat_id: str) -> ConversationBufferMemory:
+    def get(self, chat_id: str) -> Any:
         if chat_id not in self.sessions:
             self.sessions[chat_id] = ConversationBufferMemory(return_messages=True, memory_key="chat_history")
         return self.sessions[chat_id]
@@ -48,7 +75,7 @@ class RedisChatStore:
         logger.info(f"Connecting Redis memory: {settings.REDIS_URL}")
         self.r = redis.from_url(settings.REDIS_URL, decode_responses=True)
 
-    def get(self, chat_id: str) -> ConversationBufferMemory:
+    def get(self, chat_id: str) -> Any:
         mem = ConversationBufferMemory(return_messages=True, memory_key="chat_history")
         key = f"mem:{chat_id}"
         raw = self.r.get(key)
@@ -60,7 +87,7 @@ class RedisChatStore:
                 pass
         return mem
 
-    def set(self, chat_id: str, mem: ConversationBufferMemory):
+    def set(self, chat_id: str, mem: Any):
         key = f"mem:{chat_id}"
         msgs = [m.dict() for m in mem.chat_memory.messages]
         self.r.setex(key, settings.MEMORY_EXPIRY, json.dumps(msgs))

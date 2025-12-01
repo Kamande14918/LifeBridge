@@ -84,6 +84,26 @@
   </div>
 
   <script>
+    async function parseJsonResponse(r){
+      // Read the raw text first so we can show helpful diagnostics when
+      // the server returns HTML (unexpected) or invalid JSON.
+      const txt = await r.text();
+      const ct = (r.headers.get('content-type') || '').toLowerCase();
+      if(!r.ok){
+        // show raw body for non-2xx responses
+        throw new Error(`HTTP ${r.status}: ${txt.slice(0,1000)}`);
+      }
+      if(ct.includes('application/json') || ct.includes('json')){
+        try{
+          return JSON.parse(txt);
+        }catch(e){
+          throw new Error('Invalid JSON response: ' + txt.slice(0,1000));
+        }
+      }
+      // Not JSON — likely an HTML error page (starts with '<'). Return
+      // the raw text so the UI can show it and you can debug quickly.
+      throw new Error('Expected JSON but received: ' + txt.slice(0,1000));
+    }
     const chatEl = document.getElementById('chat');
     const baseInput = document.getElementById('baseUrl');
     const chatIdInput = document.getElementById('chatId');
@@ -105,7 +125,7 @@
       const base = baseInput.value.replace(/\/$/, '');
       try{
         const r = await fetch(base + '/api/health');
-        const j = await r.json();
+        const j = await parseJsonResponse(r);
         rawEl.textContent = JSON.stringify(j, null, 2);
         appendMessage('<strong>Health</strong>: ' + (j.status||'unknown'));
       }catch(e){
@@ -124,7 +144,7 @@
       const payload = { chat_id: chatIdInput.value || 'default', message: txt, k: 5 };
       try{
         const r = await fetch(base + '/api/chat', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-        const j = await r.json();
+        const j = await parseJsonResponse(r);
         rawEl.textContent = JSON.stringify(j, null, 2);
 
         // Build readable bot output
@@ -160,7 +180,7 @@
       const base = baseInput.value.replace(/\/$/, '');
       try{
         const r = await fetch(base + '/api/contacts?q=' + encodeURIComponent(q));
-        const j = await r.json();
+        const j = await parseJsonResponse(r);
         rawEl.textContent = JSON.stringify(j, null, 2);
         const el = document.getElementById('contacts');
         if(r.status === 200 && j.contacts){
@@ -180,7 +200,7 @@
       const base = baseInput.value.replace(/\/$/, '');
       try{
         const r = await fetch(base + '/api/tts', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text})});
-        const j = await r.json();
+        const j = await parseJsonResponse(r);
         rawEl.textContent = JSON.stringify(j, null, 2);
         if(j.audio_url){
           lastAudioUrl = j.audio_url; audioPlayer.src = lastAudioUrl; audioPlayer.play().catch(()=>{});
